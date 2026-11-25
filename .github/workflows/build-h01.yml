@@ -78,12 +78,15 @@ jobs:
           distribution: zulu
           java-version: "21"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install required Android SDK and NDK
+      - name: Install Android SDK and NDK using runner SDK
+        shell: bash
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          test -n "$SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
 
       - name: Build debug APK (signed with test debug key)
         working-directory: upstream
