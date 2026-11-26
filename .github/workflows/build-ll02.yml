@@ -1,0 +1,589 @@
+name: Build AirPlay VI H01 LL02 diagnostic
+
+on:
+  push:
+    branches: [h01-ll02-diagnostic]
+    paths:
+      - "translations/**"
+      - ".github/workflows/build-ll02.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airplay-server-vi-h01-ll02
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Android 8.1 ARM32 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout Vietnamese translation
+        uses: actions/checkout@v4
+
+      - name: Get upstream AirPlay Server v0.0.30
+        run: |
+          git clone --depth 1 --branch v0.0.30 --recurse-submodules \
+            https://github.com/jqssun/android-airplay-server.git upstream
+          git -C upstream submodule update --init --recursive
+
+      - name: Verify translation and use Vietnamese as default language
+        run: |
+          python3 - <<'PY'
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          en = Path("upstream/app/src/main/res/values/strings.xml")
+          vi = Path("translations/strings_vi.xml")
+          e = ET.parse(en).getroot()
+          v = ET.parse(vi).getroot()
+          def strings(root):
+              return {s.get("name"): (s.text or "") for s in root.findall("string")}
+          a, b = strings(e), strings(v)
+          assert a.keys() == b.keys(), f"Key mismatch: missing={set(a)-set(b)}, extra={set(b)-set(a)}"
+          assert len(a) == 145, f"Unexpected count: {len(a)}"
+          pat = re.compile(r'%(?:\d+\$)?[ds]|%%')
+          for key in a:
+              assert sorted(pat.findall(a[key])) == sorted(pat.findall(b[key])), f"Bad formatting placeholder: {key}"
+          array_e = e.find("./string-array[@name='audio_adaptive_step_names']")
+          array_v = v.find("./string-array[@name='audio_adaptive_step_names']")
+          assert array_e is not None and array_v is not None and len(list(array_e)) == len(list(array_v)) == 5
+          import shutil
+          shutil.copy2(vi, en)
+          print(f"OK: {len(a)} translated strings and 5 list items")
+          PY
+
+      - name: Limit native binaries to ARM32 and allow side-by-side install
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("upstream/app/build.gradle.kts")
+          s=p.read_text()
+          before='val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")'
+          assert s.count(before)==1, "Unexpected upstream ABI declaration"
+          s=s.replace(before,'val allAbis = listOf("armeabi-v7a")',1)
+          debug='        debug {\n'
+          assert s.count(debug)==1, "Unexpected debug build structure"
+          s=s.replace(debug,'        debug {\n            applicationIdSuffix = ".vi.ll02"\n',1)
+          p.write_text(s)
+          PY
+
+      - name: Apply LL01 source changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path("upstream/app/src/main/kotlin/io/github/jqssun/airplay")
+          def edit(path, pairs):
+              p = base/path
+              s = p.read_text()
+              for old, new in pairs:
+                  assert s.count(old) == 1, (path, old, s.count(old))
+                  s = s.replace(old,new,1)
+              p.write_text(s)
+          edit("Prefs.kt", [
+              ('    const val LOW_LATENCY =', '    const val H01_LL01 = "h01_ll01"; const val DEF_H01_LL01 = false\n    const val LOW_LATENCY =')
+          ])
+          edit("viewmodel/MainViewModel.kt", [
+              ('    private val _lowLatency =', '''    private val _h01Ll01 = MutableStateFlow(prefs.getBoolean(Prefs.H01_LL01, Prefs.DEF_H01_LL01))
+              val h01Ll01: StateFlow<Boolean> = _h01Ll01.asStateFlow()
+          
+              private val _lowLatency ='''),
+              ('    fun setLowLatency(v: Boolean) {', '''    fun setH01Ll01(v: Boolean) {
+                  _h01Ll01.value = v
+                  prefs.edit().putBoolean(Prefs.H01_LL01, v).apply()
+                  _applyByServerRestart()
+              }
+              fun setLowLatency(v: Boolean) {''')
+          ])
+          edit("ui/SettingsScreen.kt", [
+              ('    val lowLatency by viewModel.lowLatency.collectAsState()', '    val h01Ll01 by viewModel.h01Ll01.collectAsState()\n    val lowLatency by viewModel.lowLatency.collectAsState()'),
+              ('        if (developerOptions) {', '''        if (android.os.Build.VERSION.SDK_INT == 27) {
+                      SettingSwitch(
+                          title = "Độ trễ thấp được tối ưu riêng cho H01",
+                          description = "LL01 thử nghiệm: H.264 Qualcomm, Decode Order. Có thể phải kết nối lại nếu không tương thích. Tắt để trở về chế độ gốc.",
+                          checked = h01Ll01,
+                          onCheckedChange = { viewModel.setH01Ll01(it) }
+                      )
+                  }
+          
+                  if (developerOptions) {''')
+          ])
+          edit("service/AirPlayService.kt", [
+              ('        videoRenderer.lowLatency = lowLatency', '''        videoRenderer.lowLatency = lowLatency
+                  videoRenderer.h01LowLatency = android.os.Build.VERSION.SDK_INT == 27 &&
+                      prefs.getBoolean(Prefs.H01_LL01, Prefs.DEF_H01_LL01)'''),
+              ('        prefs.getBoolean(Prefs.H265_ENABLED, Prefs.DEF_H265_ENABLED) && VideoRenderer.supportsH265()', '''        !(android.os.Build.VERSION.SDK_INT == 27 &&
+                      prefs.getBoolean(Prefs.H01_LL01, Prefs.DEF_H01_LL01)) &&
+                      prefs.getBoolean(Prefs.H265_ENABLED, Prefs.DEF_H265_ENABLED) && VideoRenderer.supportsH265()''')
+          ])
+          edit("renderer/VideoRenderer.kt", [
+              ('    var lowLatency = true', '''    var lowLatency = true
+              var h01LowLatency = false
+              private var h01VendorActive = false
+              private var h01Fallback = false
+              private val h01Timing = LinkedHashMap<Long, Long>()
+              private var h01DecodeTotalUs = 0L
+              private var h01DecodeSamples = 0L
+              private fun h01Log(msg: String) {
+                  Log.i("H01_LL01", msg)
+                  benchmarkLogCallback?.invoke("LL01: " + msg)
+              }'''),
+              ('        val msg = "fps=$fps', '''        val llStats = if (h01DecodeSamples > 0L)
+                      " queue_to_output_avg_us=" + (h01DecodeTotalUs / h01DecodeSamples) +
+                          " samples=" + h01DecodeSamples else ""
+                  h01DecodeTotalUs = 0L
+                  h01DecodeSamples = 0L
+                  val msg = "fps=$fps'''),
+              ('            "res=\${videoWidth}x\${videoHeight}"'.replace("\\$", "$"), '            "res=\${videoWidth}x\${videoHeight}" + llStats'.replace("\\$", "$")),
+              ('            if (codec == null || isH265 != currentH265) {', '''            if (h01LowLatency && !isH265 && !h01Fallback && _hasBFrame(data)) {
+                          h01Fallback = true
+                          h01Log("B slice detected: disable experimental decode order; reconnect if video does not resume")
+                          if (h01VendorActive) stopCodec()
+                      }
+          
+                      if (codec == null || isH265 != currentH265) {'''),
+              ('                Log.w(TAG, "Codec error, resetting", e)\n                stopCodec()', '''                Log.w(TAG, "Codec error, resetting", e)
+                          if (h01VendorActive) {
+                              h01Fallback = true
+                              h01Log("Experimental decoder failed; next keyframe uses normal decoder. Reconnect if needed.")
+                          }
+                          stopCodec()'''),
+              ('                c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)', '''                val ptsUs = ntpTimeNs / 1000
+                          val queuedNs = System.nanoTime()
+                          c.queueInputBuffer(idx, 0, data.size, ptsUs, 0)
+                          if (benchmarkLog) {
+                              h01Timing[ptsUs] = queuedNs
+                              if (h01Timing.size > 256) h01Timing.remove(h01Timing.keys.first())
+                          }'''),
+              ('    private fun startCodec(h265: Boolean) {', '''    // Annex-B ordinary AVC slice headers: first_mb_in_slice, slice_type.
+              // A B slice is evidence of reordering; absence is not a proof of no reordering.
+              private fun _hasBFrame(data: ByteArray): Boolean {
+                  var i = 0
+                  while (i + 3 < data.size) {
+                      if (data[i] != 0.toByte() || data[i + 1] != 0.toByte()) {
+                          i++
+                          continue
+                      }
+                      val header = when {
+                          data[i + 2] == 1.toByte() -> i + 3
+                          data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte() -> i + 4
+                          else -> { i++; continue }
+                      }
+                      if (header >= data.size) break
+                      val type = data[header].toInt() and 31
+                      if (type == 1 || type == 5) {
+                          // Only read a small prefix; remove emulation-prevention bytes.
+                          val rbsp = ByteArray(32)
+                          var n = 0
+                          var zeroes = 0
+                          var j = header + 1
+                          while (j < data.size && n < rbsp.size) {
+                              val v = data[j++].toInt() and 255
+                              if (zeroes >= 2 && v <= 1) break
+                              if (zeroes >= 2 && v == 3) { zeroes = 0; continue }
+                              rbsp[n++] = v.toByte()
+                              zeroes = if (v == 0) zeroes + 1 else 0
+                          }
+                          var bit = 0
+                          fun nextBit(): Int {
+                              if (bit >= n * 8) return -1
+                              val pos = bit++
+                              return (rbsp[pos / 8].toInt() shr (7 - pos % 8)) and 1
+                          }
+                          fun ue(): Int {
+                              var z = 0
+                              while (true) {
+                                  val b = nextBit()
+                                  if (b < 0 || z > 24) return -1
+                                  if (b == 1) break
+                                  z++
+                              }
+                              var v = 1
+                              repeat(z) {
+                                  val b = nextBit()
+                                  if (b < 0) return -1
+                                  v = (v shl 1) or b
+                              }
+                              return v - 1
+                          }
+                          if (ue() >= 0) {
+                              val slice = ue()
+                              if (slice == 1 || slice == 6) return true
+                          }
+                      }
+                      i = header + 1
+                  }
+                  return false
+              }
+          
+              private fun startCodec(h265: Boolean) {'''),
+              ('        val format = MediaFormat.createVideoFormat(mime, videoWidth, videoHeight)', '''        fun makeFormat(): MediaFormat {
+                  val format = MediaFormat.createVideoFormat(mime, videoWidth, videoHeight)'''),
+              ('        firstFrameQueued = false\n        try {\n            _startDecoder(MediaCodec.createDecoderByType(mime), format, s, h265)', '''        return format
+                  }
+                  val format = makeFormat()
+                  firstFrameQueued = false
+                  if (h01LowLatency && !h265 && !h01Fallback && android.os.Build.VERSION.SDK_INT == 27) {
+                      try {
+                          val experimentalFormat = makeFormat()
+                          experimentalFormat.setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
+                          _startDecoder(MediaCodec.createByCodecName("OMX.qcom.video.decoder.avc"), experimentalFormat, s, false)
+                          h01VendorActive = true
+                          h01Log("Vendor Decode Order requested; codec started; driver acceptance NOT yet verified")
+                          return
+                      } catch (e: Exception) {
+                          h01Fallback = true
+                          h01Log("Experimental configure/start failed; use unmodified format: " + e.javaClass.simpleName)
+                      }
+                  }
+                  try {
+                      _startDecoder(MediaCodec.createDecoderByType(mime), format, s, h265)'''),
+              ('        codec = null\n    }', '''        codec = null
+                  h01VendorActive = false
+                  h01Timing.clear()
+              }'''),
+              ('            if (idx < 0) break\n            _recordOutputFrameTime()', '''            if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED && h01VendorActive) {
+                          val key = "vendor.qti-ext-dec-picture-order.enable"
+                          val reported = try {
+                              val output = c.outputFormat
+                              if (output.containsKey(key)) output.getInteger(key).toString() else "not exposed"
+                          } catch (_: Exception) { "unavailable" }
+                          h01Log("Output format vendor key=" + reported + "; not a driver-level confirmation")
+                          continue
+                      }
+                      if (idx < 0) break
+                      if (benchmarkLog) {
+                          h01Timing.remove(info.presentationTimeUs)?.let {
+                              h01DecodeTotalUs += (System.nanoTime() - it) / 1000L
+                              h01DecodeSamples++
+                          }
+                      }
+                      _recordOutputFrameTime()'''),
+              ('        pipeline.release()\n        fps =', '''        pipeline.release()
+                  h01Fallback = false
+                  h01DecodeTotalUs = 0L
+                  h01DecodeSamples = 0L
+                  fps =''')
+          ])
+          p = Path("upstream/app/src/main/res/values/strings.xml")
+          s = p.read_text()
+          import re
+          s, n = re.subn(r'(<string name="app_name">)[^<]*(</string>)', r'\g<1>AirPlay VI H01 LL01\g<2>', s)
+          assert n == 1
+          p.write_text(s)
+          print("LL01 source patch applied")
+          PY
+
+      - name: Apply LL02 diagnostic changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("upstream/app/src/main")
+          base = root/"kotlin/io/github/jqssun/airplay"
+          def edit(p, pairs):
+              s = p.read_text()
+              for old,new in pairs:
+                  assert s.count(old)==1, (str(p),old,s.count(old))
+                  s=s.replace(old,new,1)
+              p.write_text(s)
+          
+          edit(base/"Prefs.kt", [
+              ('    const val H01_LL01 =', '    const val H01_VIDEO_ONLY = "h01_video_only"; const val DEF_H01_VIDEO_ONLY = true\n    const val H01_LL01 =')
+          ])
+          edit(base/"viewmodel/MainViewModel.kt", [
+              ('    private val _h01Ll01 =', '''    private val _h01VideoOnly = MutableStateFlow(prefs.getBoolean(Prefs.H01_VIDEO_ONLY, Prefs.DEF_H01_VIDEO_ONLY))
+              val h01VideoOnly: StateFlow<Boolean> = _h01VideoOnly.asStateFlow()
+          
+              private val _h01Ll01 ='''),
+              ('    fun setH01Ll01(v: Boolean) {', '''    fun setH01VideoOnly(v: Boolean) {
+                  _h01VideoOnly.value = v
+                  prefs.edit().putBoolean(Prefs.H01_VIDEO_ONLY, v).apply()
+                  _applyByServerRestart()
+              }
+              fun setH01Ll01(v: Boolean) {'''),
+              ('    fun exportLogs() {', '''    private fun logText(): String = synchronized(_logLock) {
+                  _logList.joinToString("\\n", postfix = "\\n")
+              }
+          
+              fun saveLogsToH01() {
+                  val ctx = getApplication<Application>()
+                  val snapshot = logText()
+                  viewModelScope.launch {
+                      val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                          runCatching {
+                              val dir = ctx.getExternalFilesDir("H01-LL02")
+                                  ?: File(ctx.filesDir, "H01-LL02")
+                              check(dir.isDirectory || dir.mkdirs()) { "Cannot create log directory" }
+                              val file = File(dir, "log.txt")
+                              file.writeText(snapshot, Charsets.UTF_8)
+                              file.absolutePath
+                          }
+                      }
+                      val msg = result.fold(
+                          { "Đã lưu: " + it },
+                          { "Không lưu được log: " + it.message }
+                      )
+                      addLog(msg)
+                      android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_LONG).show()
+                  }
+              }
+          
+              fun saveLogsToUri(uri: android.net.Uri) {
+                  val ctx = getApplication<Application>()
+                  val snapshot = logText()
+                  viewModelScope.launch {
+                      val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                          runCatching {
+                              val stream = ctx.contentResolver.openOutputStream(uri, "wt")
+                                  ?: error("Cannot open output stream")
+                              stream.use { it.write(snapshot.toByteArray(Charsets.UTF_8)) }
+                          }
+                      }
+                      val msg = result.fold(
+                          { "Đã xuất log.txt" },
+                          { "Không xuất được: " + it.message }
+                      )
+                      addLog(msg)
+                      android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_LONG).show()
+                  }
+              }
+          
+              fun exportLogs() {'''),
+              ('val file = File(ctx.cacheDir, "airplay_logs.txt")\n        file.writeText(_logList.joinToString("\\n"))', 'val file = File(ctx.cacheDir, "log.txt")\n        file.writeText(logText(), Charsets.UTF_8)'),
+              ('            persistLogsLocked()\n            snapshot = _logList.toList()', '''            // Keep UI history bounded, avoid rewriting the whole file on every event.
+                      runCatching {
+                          if (logFile.length() > 1024 * 1024) persistLogsLocked()
+                          else logFile.appendText(line + "\\n")
+                      }
+                      snapshot = _logList.toList()''')
+          ])
+          edit(base/"ui/SettingsScreen.kt", [
+              ('    val h01Ll01 by viewModel.h01Ll01.collectAsState()', '''    val h01VideoOnly by viewModel.h01VideoOnly.collectAsState()
+              val h01Ll01 by viewModel.h01Ll01.collectAsState()'''),
+              ('        if (android.os.Build.VERSION.SDK_INT == 27) {\n            SettingSwitch(', '''        SettingSwitch(
+                      title = "Chỉ truyền hình ảnh – Không âm thanh",
+                      description = "Bỏ qua bộ phát Oboe và dữ liệu âm thanh native. Khởi động lại server khi đổi.",
+                      checked = h01VideoOnly,
+                      onCheckedChange = { viewModel.setH01VideoOnly(it) }
+                  )
+          
+                  if (android.os.Build.VERSION.SDK_INT == 27) {
+                      SettingSwitch('''),
+              ('LL01 thử nghiệm:', 'LL02 thử nghiệm:')
+          ])
+          edit(base/"service/AirPlayService.kt", [
+              ('    val audioRenderer = AudioRenderer()', '''    val audioRenderer = AudioRenderer()
+              @Volatile private var h01VideoOnly = true'''),
+              ('        NativeBridge.nativeSetDefaultStreamValues(', '''        h01VideoOnly = prefs.getBoolean(Prefs.H01_VIDEO_ONLY, Prefs.DEF_H01_VIDEO_ONLY)
+                  if (!h01VideoOnly) NativeBridge.nativeSetDefaultStreamValues('''),
+              ('        audioRenderer.attachEngine(nativeHandle)', '''        if (h01VideoOnly) {
+                      NativeBridge.nativeDisableAudioEngine(nativeHandle)
+                      log("LL02: video-only; native audio engine disabled before server start")
+                  } else {
+                      audioRenderer.attachEngine(nativeHandle)
+                      log("LL02: audio enabled for comparison")
+                  }'''),
+              ('        val advertiseAudio = prefs.getBoolean(Prefs.ADVERTISE_AUDIO, Prefs.DEF_ADVERTISE_AUDIO)', '        val advertiseAudio = !h01VideoOnly && prefs.getBoolean(Prefs.ADVERTISE_AUDIO, Prefs.DEF_ADVERTISE_AUDIO)'),
+              ('        if (prefs.getBoolean(Prefs.ADVERTISE_AUDIO, Prefs.DEF_ADVERTISE_AUDIO)) {', '        if (advertiseAudio) {'),
+              ('        NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)', '''        // Keep codec TXT bits for sender compatibility; audio feature and RAOP advertisement are disabled below.
+                  NativeBridge.nativeSetCodecs(nativeHandle, alac, aac)'''),
+              ('        videoRenderer.benchmarkLog = prefs.getBoolean(Prefs.BENCHMARK_LOG, Prefs.DEF_BENCHMARK_LOG)', '        videoRenderer.benchmarkLog = true'),
+              ('    override fun onAudioFormat(ct: Int, spf: Int, usingScreen: Boolean) {\n        clearPin()', '''    override fun onAudioFormat(ct: Int, spf: Int, usingScreen: Boolean) {
+                  if (h01VideoOnly) {
+                      log("LL02: ignored audio format ct=" + ct + " spf=" + spf + " screen=" + usingScreen)
+                      return
+                  }
+                  clearPin()'''),
+              ('    override fun onAudioOnly(audioOnly: Boolean) {\n        val prev', '''    override fun onAudioOnly(audioOnly: Boolean) {
+                  if (h01VideoOnly && audioOnly) return
+                  val prev'''),
+              ('    override fun onVolumeChange(volume: Float) {', '    override fun onVolumeChange(volume: Float) {\n        if (h01VideoOnly) return'),
+              ('    override fun onClientVolume(): Float {', '    override fun onClientVolume(): Float {\n        if (h01VideoOnly) return 0f'),
+              ('        log("Server started on port $port")', '''        log("Server started on port $port")
+                  log("LL02 config videoOnly=" + h01VideoOnly + " h265=" + h265 +
+                      " decodeOrder=" + videoRenderer.h01LowLatency + " fps=" + maxFps +
+                      " advertised=" + w + "x" + h + " operatingRate=" + videoRenderer.operatingRateHint +
+                      " scheduled=" + videoRenderer.scheduledOutputBufferRelease)''')
+          ])
+          edit(root/"cpp/native_bridge.cpp", [
+              ('/* feature bit 9 advertises audio support over dns-sd */', '''/* LL02: call only after nativeInit and before nativeStart; no RAOP decode callback in flight. */
+          extern "C"
+          JNIEXPORT void JNICALL
+          Java_io_github_jqssun_airplay_bridge_NativeBridge_nativeDisableAudioEngine(
+                  JNIEnv *env, jobject thiz, jlong handle) {
+              server_ctx_t *ctx = (server_ctx_t *)(intptr_t)handle;
+              if (!ctx) return;
+              AudioEngine *engine = ctx->cb_ctx.audio_engine;
+              ctx->cb_ctx.audio_engine = NULL;
+              if (engine) audio_engine_destroy(engine);
+          }
+          
+          /* feature bit 9 advertises audio support over dns-sd */''')
+          ])
+          p=base/"bridge/NativeBridge.kt"
+          s=p.read_text()
+          import re
+          s,n=re.subn(r'(?m)^(\s*)external fun nativeSetAudioEnabled\(', r'\1external fun nativeDisableAudioEngine(handle: Long)\n\1external fun nativeSetAudioEnabled(',s)
+          assert n==1
+          p.write_text(s)
+          edit(base/"renderer/VideoRenderer.kt", [
+              ('    private var h01VendorActive = false', '''    private var h01Stage = "idle"
+              private var h01InputIndex = -1
+              private var h01OutputIndex = -1
+              private var h01InputCapacity = -1
+              private var h01InputBytes = 0
+              private var h01Queued = 0L
+              private var h01Output = 0L
+              private var h01InputWaits = 0L
+              private var h01NoOutput = 0L
+              private var h01LastPts = 0L
+              private var h01VendorActive = false'''),
+              ('    private var h01Fallback = false', '''    private var h01Fallback = false
+              private fun h01Error(e: Exception) {
+                  val detail = if (e is MediaCodec.CodecException)
+                      " code=" + e.errorCode + " hex=0x" + Integer.toHexString(e.errorCode) +
+                      " diagnostic=" + e.diagnosticInfo + " recoverable=" + e.isRecoverable +
+                      " transient=" + e.isTransient
+                  else ""
+                  h01Log("ERROR stage=" + h01Stage + " exception=" + e.javaClass.name +
+                      " message=" + e.message + detail + " codec=" + codecName +
+                      " vendorRequested=" + h01VendorActive + " res=" + videoWidth + "x" + videoHeight +
+                      " inputIndex=" + h01InputIndex + " capacity=" + h01InputCapacity +
+                      " inputBytes=" + h01InputBytes + " outputIndex=" + h01OutputIndex +
+                      " queued=" + h01Queued + " output=" + h01Output +
+                      " inputWaits=" + h01InputWaits + " noOutput=" + h01NoOutput +
+                      " lastPtsUs=" + h01LastPts)
+                  h01Log(Log.getStackTraceString(e).take(4000))
+              }'''),
+              ('Log.i("H01_LL01", msg)', 'Log.i("H01_LL02", msg)'),
+              ('benchmarkLogCallback?.invoke("LL01: " + msg)', 'benchmarkLogCallback?.invoke("LL02: " + msg)'),
+              ('        Log.i(BENCH_TAG, msg)', '''        Log.i(BENCH_TAG, msg)
+                  h01Log("buffers queued=" + h01Queued + " output=" + h01Output +
+                      " pendingEstimate=" + (h01Queued - h01Output).coerceAtLeast(0L) +
+                      " inputWaits=" + h01InputWaits + " noOutput=" + h01NoOutput +
+                      " lastInputBytes=" + h01InputBytes + " capacity=" + h01InputCapacity)'''),
+              ('                Log.w(TAG, "Codec error, resetting", e)', '''                h01Error(e)
+                          Log.w(TAG, "Codec error, resetting", e)'''),
+              ('            val idx = c.dequeueInputBuffer(FEED_WAIT_US)', '''            h01Stage = "dequeueInputBuffer"
+                      h01InputBytes = data.size
+                      h01InputIndex = -1
+                      h01InputCapacity = -1
+                      val idx = c.dequeueInputBuffer(FEED_WAIT_US)
+                      h01InputIndex = idx
+                      if (idx < 0) h01InputWaits++'''),
+              ('                val buf = c.getInputBuffer(idx) ?: return\n                buf.clear()\n                buf.put(data)', '''                h01Stage = "getInputBuffer"
+                          val buf = c.getInputBuffer(idx) ?: error("Null input buffer")
+                          buf.clear()
+                          h01InputCapacity = buf.remaining()
+                          h01Stage = "copyInputBuffer"
+                          check(data.size <= buf.remaining()) { "Input exceeds codec buffer: " + data.size + "/" + buf.remaining() }
+                          buf.put(data)'''),
+              ('                c.queueInputBuffer(idx, 0, data.size, ptsUs, 0)', '''                h01Stage = "queueInputBuffer"
+                          h01LastPts = ptsUs
+                          c.queueInputBuffer(idx, 0, data.size, ptsUs, 0)
+                          h01Queued++'''),
+              ('        pipeline.start()', '''        h01Stage = "pipeline.start"
+                  pipeline.start()'''),
+              ('        val s = pipeline.inputSurface ?: return', '''        val s = pipeline.inputSurface ?: run {
+                      h01Log("pipeline has no input surface")
+                      return
+                  }'''),
+              ('                val experimentalFormat = makeFormat()', '''                h01Stage = "create Qualcomm decoder"
+                          val experimentalFormat = makeFormat()'''),
+              ('                h01Fallback = true\n                h01Log("Experimental configure/start failed;', '                h01Error(e)\n                h01Fallback = true\n                h01Log("Experimental configure/start failed;'),
+              ('            _startDecoder(MediaCodec.createDecoderByType(mime), format, s, h265)', '''            h01Stage = "create default decoder"
+                      _startDecoder(MediaCodec.createDecoderByType(mime), format, s, h265)'''),
+              ('            c.configure(format, surface, null, 0)\n            c.start()', '''            h01Stage = "configure"
+                      codecName = c.name
+                      h01Log("configure codec=" + c.name + " surfaceValid=" + surface.isValid + " format=" + format)
+                      c.configure(format, surface, null, 0)
+                      h01Stage = "start"
+                      c.start()
+                      h01Log("start OK codec=" + c.name)'''),
+              ('            try {\n                it.stop()\n                it.release()\n            } catch (_: Exception) {}', '''            try { it.stop() } catch (e: Exception) { h01Log("stop: " + e.message) }
+                      try { it.release() } catch (e: Exception) { h01Log("release: " + e.message) }'''),
+              ('            val idx = c.dequeueOutputBuffer(info, 0)', '''            h01Stage = "dequeueOutputBuffer"
+                      val idx = c.dequeueOutputBuffer(info, 0)
+                      h01OutputIndex = idx
+                      if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) h01NoOutput++
+                      if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) h01Log("output format=" + c.outputFormat)'''),
+              ('            _recordOutputFrameTime()\n            if (scheduledOutputBufferRelease)', '''            h01Output++
+                      h01Stage = "releaseOutputBuffer"
+                      _recordOutputFrameTime()
+                      if (scheduledOutputBufferRelease)'''),
+              ('        h01Fallback = false\n        h01DecodeTotalUs', '''        h01Fallback = false
+                  h01Queued = 0L; h01Output = 0L; h01InputWaits = 0L; h01NoOutput = 0L
+                  h01InputIndex = -1; h01OutputIndex = -1; h01InputCapacity = -1
+                  h01InputBytes = 0; h01LastPts = 0L
+                  h01DecodeTotalUs''')
+          ])
+          edit(base/"ui/LogsScreen.kt", [
+              ('    val listState = rememberLazyListState()', '''    val listState = rememberLazyListState()
+              val ctx = androidx.compose.ui.platform.LocalContext.current
+              val saveDocument = androidx.activity.compose.rememberLauncherForActivityResult(
+                  androidx.activity.result.contract.ActivityResultContracts.CreateDocument("text/plain")
+              ) { uri -> if (uri != null) viewModel.saveLogsToUri(uri) }'''),
+              ('        SelectionContainer {', '''        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                      TextButton(onClick = { viewModel.saveLogsToH01() }) { Text("Lưu log.txt") }
+                      TextButton(onClick = {
+                          try { saveDocument.launch("log.txt") }
+                          catch (_: Exception) {
+                              android.widget.Toast.makeText(ctx, "Không có trình chọn tệp. Dùng Lưu log.txt.", android.widget.Toast.LENGTH_LONG).show()
+                          }
+                      }) { Text("Chọn nơi lưu") }
+                  }
+          
+                  SelectionContainer {''')
+          ])
+          p=root/"res/values/strings.xml"
+          s=p.read_text().replace("AirPlay VI H01 LL01","AirPlay VI H01 LL02")
+          p.write_text(s)
+          print("LL02 source patch applied")
+          PY
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "21"
+
+      - name: Install Android SDK and NDK using runner SDK
+        shell: bash
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          test -n "$SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+
+      - name: Build debug APK (signed with test debug key)
+        working-directory: upstream
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug --stacktrace
+
+      - name: Prepare APK
+        run: |
+          mkdir -p dist
+          cp upstream/app/build/outputs/apk/debug/app-debug.apk dist/AirPlay_Server_VI_H01_LL02.apk
+          sha256sum dist/AirPlay_Server_VI_H01_LL02.apk | tee dist/SHA256.txt
+          cat > dist/README_VI.txt <<'TXT'
+          AirPlay Server VI — bản thử nghiệm cho ZEUS H01
+          Android 8.1 / ARM32 / upstream v0.0.30
+          APK được ký bằng khóa debug của GitHub runner; không phải bản chính thức.
+          Có thể cài song song với bản gốc, nhưng hãy tắt bản gốc trước khi mở bản VI.
+          LL02: mặc định chỉ hình ảnh, Decode Order tắt. Logger chi tiết; lưu log.txt từ tab Nhật ký. Không sửa firmware.
+          TXT
+
+      - name: Upload installation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirPlay_Server_VI_H01_LL02_APK
+          path: dist/*
+          retention-days: 30
+          if-no-files-found: error
